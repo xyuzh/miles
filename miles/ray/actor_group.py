@@ -118,7 +118,45 @@ class RayTrainGroup:
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
+        if getattr(self.args, "use_rdt_weight_sync", False):
+            return self._update_weights_rdt()
         return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
+
+    def _update_weights_rdt(self):
+        """Orchestrate RDT weight sync with bucket-by-bucket transfers."""
+        source = self._actor_handlers[0]  # DP=0, TP=0 (PP source)
+
+        # Step 1: All ranks start weight sync (pause/flush + init iterator)
+        ray.get([a.update_weights.remote() for a in self._actor_handlers])
+
+        # Step 2: Get scheduler actors once
+        scheduler_actors = ray.get(source.get_scheduler_actors.remote())
+
+        # Step 3: Bucket loop
+        while True:
+            # All ranks prepare next bucket (TP/EP all-gather + HF convert)
+            has_bucket_results = ray.get([
+                a.prepare_next_rdt_bucket.remote() for a in self._actor_handlers
+            ])
+            if not has_bucket_results[0]:  # source rank reports no more buckets
+                break
+
+            # Source exports this bucket via RDT (NIXL)
+            metadata_json = ray.get(source.get_bucket_metadata_json.remote())
+            weights_ref = source.export_weights_rdt.remote()
+
+            # All SchedulerActors pull concurrently (non-blocking NIXL RDMA)
+            engine_refs = [
+                a.receive_weights_rdt.remote(weights_ref, metadata_json)
+                for a in scheduler_actors
+            ]
+            ray.get(engine_refs)
+
+            # Free this bucket's GPU memory before preparing next
+            ray.get(source.cleanup_rdt_bucket.remote())
+
+        # Step 4: Resume generation on all engines
+        ray.get([a.finish_rdt_weight_sync.remote() for a in self._actor_handlers])
 
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])

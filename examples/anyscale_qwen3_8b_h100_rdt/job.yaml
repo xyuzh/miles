@@ -1,0 +1,34 @@
+# Anyscale job config: Miles Qwen3-8B GRPO training on H100 with RDT weight sync
+# Single node x 8x H100-80GB
+#
+# Uses the existing Docker image (no rebuild). Local sglang/miles source is
+# overlaid at runtime via shared storage.
+#
+# Before submitting, bundle local sglang:
+#   bash examples/anyscale_qwen3_8b_h100_rdt/prepare.sh
+#
+# Submit with:
+#   anyscale job submit -f examples/anyscale_qwen3_8b_h100_rdt/job.yaml
+cloud: anyscale-v2-cloud-us-east-1
+
+name: miles-qwen3-8b-grpo-h100
+
+containerfile: examples/anyscale_qwen3_8b_h100/Dockerfile.anyscale
+
+compute_config:
+  head_node:
+    instance_type: m5.2xlarge       # CPU-only, runs driver script
+  worker_nodes:
+    - instance_type: p5.48xlarge    # 8x H100-80GB, 192 vCPU, 2048 GB RAM
+      min_nodes: 1
+      max_nodes: 1
+      advanced_instance_config:
+        CapacityReservationSpecification:
+          CapacityReservationTarget:
+            CapacityReservationId: cr-0dfe1157d299ae5fc
+
+working_dir: .
+
+entrypoint: pip install -e . --no-deps && bash examples/anyscale_qwen3_8b_h100_rdt/entrypoint.sh
+
+max_retries: 0

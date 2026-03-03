@@ -88,6 +88,7 @@ class RolloutManager:
         self.num_new_engines = init_rollout_engines(args, pg, self.all_rollout_engines)
         self.nodes_per_engine = max(1, args.rollout_num_gpus_per_engine // args.num_gpus_per_node)
         self.rollout_engine_lock = Lock.options(num_cpus=1, num_gpus=0).remote()
+
         self.rollout_id = -1
 
         self._metric_checker = MetricChecker.maybe_create(args)

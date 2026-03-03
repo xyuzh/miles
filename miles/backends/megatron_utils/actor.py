@@ -38,6 +38,7 @@ from .parallel import create_megatron_parallel_state
 from .replay_utils import get_register_replay_list_func
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
+from .update_weight.update_weight_from_rdt import UpdateWeightFromRDT
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
@@ -134,7 +135,12 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+        if getattr(self.args, "use_rdt_weight_sync", False):
+            update_weight_cls = UpdateWeightFromRDT
+        elif self.args.colocate:
+            update_weight_cls = UpdateWeightFromTensor
+        else:
+            update_weight_cls = UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
@@ -151,8 +157,6 @@ class MegatronTrainRayActor(TrainRayActor):
             # recover to actor in the end.
             self._switch_model("actor")
             self.sleep()
-
-        self.rollout_engines = None
 
         self.rollout_data_postprocess = None
         if self.args.rollout_data_postprocess_path is not None:
@@ -496,7 +500,8 @@ class MegatronTrainRayActor(TrainRayActor):
             torch_memory_saver.resume()
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
-            self.weight_updater.update_weights()
+            with timer("update_weights_transfer"):
+                self.weight_updater.update_weights()
             print_memory("after update_weights")
 
             if self.args.ci_test and len(rollout_engines) > 0 and not is_lora_enabled(self.args):
@@ -510,10 +515,7 @@ class MegatronTrainRayActor(TrainRayActor):
             if getattr(self.args, "keep_old_actor", False):
                 if self.args.update_weights_interval == 1:
                     logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
-                    # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
-                    # First copy rollout_actor to old_actor
                     self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
-                    # Then copy current actor to rollout_actor
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
@@ -522,6 +524,35 @@ class MegatronTrainRayActor(TrainRayActor):
             if is_lora_enabled(self.args):
                 torch_memory_saver.pause()
             destroy_process_groups()
+
+    # ------------------------------------------------------------------
+    # RDT weight export (called by driver via .remote())
+    # ------------------------------------------------------------------
+
+    @ray.method(tensor_transport="nixl")
+    def export_weights_rdt(self) -> torch.Tensor:
+        """Export prepared weight bucket via RDT/NIXL."""
+        return self.weight_updater._current_flat_tensor
+
+    def get_bucket_metadata_json(self) -> str:
+        """Return bucket metadata as JSON."""
+        return self.weight_updater._current_metadata_json
+
+    def get_scheduler_actors(self) -> list:
+        """Return SchedulerActor handles for RDT weight sync."""
+        return self.weight_updater.scheduler_actors or []
+
+    def prepare_next_rdt_bucket(self) -> bool:
+        """Prepare the next weight bucket for RDT export. Returns True if bucket ready."""
+        return self.weight_updater.prepare_next_bucket()
+
+    def finish_rdt_weight_sync(self) -> None:
+        """Resume engines after all buckets transferred."""
+        self.weight_updater.finish_weight_sync()
+
+    def cleanup_rdt_bucket(self) -> None:
+        """Free the flat tensor buffer after RDT transfer."""
+        self.weight_updater.cleanup_bucket()
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
