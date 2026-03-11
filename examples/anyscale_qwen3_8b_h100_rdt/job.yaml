@@ -9,7 +9,7 @@
 #
 # Submit with:
 #   anyscale job submit -f examples/anyscale_qwen3_8b_h100_rdt/job.yaml
-cloud: anyscale-v2-cloud-us-east-1
+cloud:
 
 name: miles-qwen3-8b-grpo-h100
 
@@ -19,13 +19,10 @@ compute_config:
   head_node:
     instance_type: m5.2xlarge       # CPU-only, runs driver script
   worker_nodes:
-    - instance_type: p5.48xlarge    # 8x H100-80GB, 192 vCPU, 2048 GB RAM
+    - instance_type: p4d.24xlarge    # 8x H100-80GB, 192 vCPU, 2048 GB RAM
       min_nodes: 1
       max_nodes: 1
-      advanced_instance_config:
-        CapacityReservationSpecification:
-          CapacityReservationTarget:
-            CapacityReservationId: cr-0dfe1157d299ae5fc
+
 
 working_dir: .
 

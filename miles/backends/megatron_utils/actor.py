@@ -150,6 +150,9 @@ class MegatronTrainRayActor(TrainRayActor):
             is_lora=is_lora_enabled(args),
         )
 
+        if isinstance(self.weight_updater, UpdateWeightFromRDT):
+            self.weight_updater.set_actor_handle(ray.get_runtime_context().current_actor)
+
         # empty cache after initialization
         clear_memory()
 
@@ -529,30 +532,10 @@ class MegatronTrainRayActor(TrainRayActor):
     # RDT weight export (called by driver via .remote())
     # ------------------------------------------------------------------
 
-    @ray.method(tensor_transport="nixl")
-    def export_weights_rdt(self) -> torch.Tensor:
-        """Export prepared weight bucket via RDT/NIXL."""
-        return self.weight_updater._current_flat_tensor
-
-    def get_bucket_metadata_json(self) -> str:
-        """Return bucket metadata as JSON."""
-        return self.weight_updater._current_metadata_json
-
-    def get_scheduler_actors(self) -> list:
-        """Return SchedulerActor handles for RDT weight sync."""
-        return self.weight_updater.scheduler_actors or []
-
-    def prepare_next_rdt_bucket(self) -> bool:
-        """Prepare the next weight bucket for RDT export. Returns True if bucket ready."""
-        return self.weight_updater.prepare_next_bucket()
-
-    def finish_rdt_weight_sync(self) -> None:
-        """Resume engines after all buckets transferred."""
-        self.weight_updater.finish_weight_sync()
-
-    def cleanup_rdt_bucket(self) -> None:
-        """Free the flat tensor buffer after RDT transfer."""
-        self.weight_updater.cleanup_bucket()
+    @ray.method(concurrency_group="rdt_export", tensor_transport="nixl")
+    def export_weights_rdt(self, tp_rank: int) -> list:
+        """Export prepared weight bucket for a specific TP rank via RDT/NIXL."""
+        return self.weight_updater._tp_rank_views[tp_rank]
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune

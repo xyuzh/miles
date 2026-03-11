@@ -6,7 +6,7 @@
 # Layout (GPU worker):
 #   Worker 0 (8x H100):
 #     GPU 0-3: Training (TP=2, DP=2)
-#     GPU 4-7: Rollout (4 SGLang engines, 1 GPU each)
+#     GPU 4-7: Rollout (2 SGLang engines, 2 GPUs each)
 
 set -ex
 
@@ -42,7 +42,6 @@ MODEL_ARGS=(
 echo "=== Syncing local sglang/miles to shared storage ==="
 mkdir -p ${CODE_DIR}
 rsync -a --delete _bundled/sglang_python/ ${CODE_DIR}/sglang_python/
-rsync -a --delete _bundled/ray_experimental/ ${CODE_DIR}/ray_experimental/
 rsync -a --delete miles/ ${CODE_DIR}/miles/
 cp train_async.py ${CODE_DIR}/train_async.py
 
@@ -58,30 +57,8 @@ rm -rf "$SGLANG_PATH/srt" && cp -r ${CODE_DIR}/sglang_python/sglang/srt "$SGLANG
 if [ -d "${CODE_DIR}/sglang_python/sglang/jit_kernel" ]; then
     rm -rf "$SGLANG_PATH/jit_kernel" && cp -r ${CODE_DIR}/sglang_python/sglang/jit_kernel "$SGLANG_PATH/jit_kernel"
 fi
-
-# Get ray install path (before overlay, so import ray still works with old experimental)
-RAY_PATH=$(python3 -c "import ray, os; print(os.path.dirname(ray.__file__))")
-
-# Patch missing constants into ray_constants.py BEFORE overlaying ray/experimental.
-# The new experimental code imports these constants at module load time, so they must
-# exist before the overlay. We use shell (not Python import) to avoid triggering the
-# import chain after overlay.
-RAY_CONSTANTS="$RAY_PATH/_private/ray_constants.py"
-if ! grep -q 'NIXL_REMOTE_AGENT_CACHE_MAXSIZE' "$RAY_CONSTANTS"; then
-    cat >> "$RAY_CONSTANTS" << 'PATCH'
-
-# Patched: constants needed by ray.experimental.gpu_object_manager (Ray 3.0)
-import os
-NIXL_REMOTE_AGENT_CACHE_MAXSIZE = int(os.environ.get("RAY_NIXL_REMOTE_AGENT_CACHE_MAXSIZE", "1000"))
-RDT_FETCH_FAIL_TIMEOUT_SECONDS = int(os.environ.get("RAY_rdt_fetch_fail_timeout_milliseconds", "60000")) / 1000
-PATCH
-    echo "Patched NIXL_REMOTE_AGENT_CACHE_MAXSIZE + RDT_FETCH_FAIL_TIMEOUT_SECONDS into ray_constants.py"
-else
-    echo "Constants already exist in ray_constants.py"
-fi
-
-# Overlay local ray/experimental onto Docker-installed version (PR #60689: send-side caching)
-rm -rf "$RAY_PATH/experimental" && cp -r ${CODE_DIR}/ray_experimental "$RAY_PATH/experimental"
+# Also overlay utils.py (needed for _prebind_listening_socket etc.)
+cp -f ${CODE_DIR}/sglang_python/sglang/utils.py "$SGLANG_PATH/utils.py"
 
 # Upgrade flashinfer to match local sglang's requirements
 pip install --no-cache-dir -q flashinfer_python==0.6.3 flashinfer_cubin==0.6.3

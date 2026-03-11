@@ -4,7 +4,6 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 
 
 class RayTrainGroup:
@@ -48,14 +47,17 @@ class RayTrainGroup:
 
         # Use placement group to lock resources for models of same type
         assert pg is not None
-        pg, reordered_bundle_indices, _reordered_gpu_ids = pg
+        pg, reordered_bundle_indices, reordered_gpu_ids = pg
 
         env_vars = {
             # because sglang will always set NCCL_CUMEM_ENABLE to 0
             # we need also set it to 0 to prevent nccl error.
             "NCCL_CUMEM_ENABLE": os.environ.get("NCCL_CUMEM_ENABLE", "0"),
             "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": "1",
-            **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
+            # Override the job-level NOSET setting so Ray sets CUDA_VISIBLE_DEVICES
+            # for training actors. This ensures each NCCL rank sees only its assigned GPU.
+            # NIXL/RDT still works because it uses CUDA driver APIs for physical GPU IDs.
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0",
             **self.args.train_env_vars,
         }
 
@@ -83,7 +85,12 @@ class RayTrainGroup:
 
             actor_impl = FSDPTrainRayActor
 
-        TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
+        remote_kwargs = {"num_gpus": 1, "runtime_env": {"env_vars": env_vars}}
+        if getattr(self.args, "use_rdt_weight_sync", False):
+            rdt_tp_size = getattr(self.args, "rollout_num_gpus_per_engine", 1)
+            remote_kwargs["max_concurrency"] = 1 + rdt_tp_size
+            remote_kwargs["concurrency_groups"] = {"rdt_export": rdt_tp_size}
+        TrainRayActor = ray.remote(**remote_kwargs)(actor_impl)
 
         # Create worker actors
         self._actor_handlers = []
@@ -118,45 +125,7 @@ class RayTrainGroup:
 
     def update_weights(self):
         """Broadcast weights from rank 0 to all other ranks."""
-        if getattr(self.args, "use_rdt_weight_sync", False):
-            return self._update_weights_rdt()
         return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
-
-    def _update_weights_rdt(self):
-        """Orchestrate RDT weight sync with bucket-by-bucket transfers."""
-        source = self._actor_handlers[0]  # DP=0, TP=0 (PP source)
-
-        # Step 1: All ranks start weight sync (pause/flush + init iterator)
-        ray.get([a.update_weights.remote() for a in self._actor_handlers])
-
-        # Step 2: Get scheduler actors once
-        scheduler_actors = ray.get(source.get_scheduler_actors.remote())
-
-        # Step 3: Bucket loop
-        while True:
-            # All ranks prepare next bucket (TP/EP all-gather + HF convert)
-            has_bucket_results = ray.get([
-                a.prepare_next_rdt_bucket.remote() for a in self._actor_handlers
-            ])
-            if not has_bucket_results[0]:  # source rank reports no more buckets
-                break
-
-            # Source exports this bucket via RDT (NIXL)
-            metadata_json = ray.get(source.get_bucket_metadata_json.remote())
-            weights_ref = source.export_weights_rdt.remote()
-
-            # All SchedulerActors pull concurrently (non-blocking NIXL RDMA)
-            engine_refs = [
-                a.receive_weights_rdt.remote(weights_ref, metadata_json)
-                for a in scheduler_actors
-            ]
-            ray.get(engine_refs)
-
-            # Free this bucket's GPU memory before preparing next
-            ray.get(source.cleanup_rdt_bucket.remote())
-
-        # Step 4: Resume generation on all engines
-        ray.get([a.finish_rdt_weight_sync.remote() for a in self._actor_handlers])
 
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])

@@ -1,5 +1,5 @@
 """
-Update SchedulerActor engines via RDT/NIXL. No NCCL groups needed.
+Update SchedulerActor engines via RDT/NIXL.
 Trainer builds FlattenedTensorBucket, exports via @ray.method(tensor_transport="nixl"),
 SchedulerActors pull concurrently.
 
@@ -38,6 +38,11 @@ class CudaRawBuffer:
     """
 
     def __init__(self, size_bytes: int):
+        if size_bytes <= 0:
+            raise ValueError(
+                f"CudaRawBuffer requires positive size, got {size_bytes}. "
+                "This likely means no tensors matched sharding recipes."
+            )
         from sglang.srt.distributed.device_communicators.cuda_wrapper import CudaRTLibrary
         self._lib = CudaRTLibrary()
         self._ptr = self._lib.cudaMalloc(size_bytes)
@@ -60,6 +65,74 @@ class CudaRawBuffer:
 
     def __del__(self):
         self.free()
+
+
+class RecipeShardedBucketBuilder:
+    """Builds pre-sharded weight tensors using sharding recipes from sglang.
+
+    Each recipe describes exactly which narrow() ops to apply to a full HF
+    tensor to produce the shard for a specific TP rank.  Stacked params
+    (QKV, gate_up) are accumulated by concat_group and fused once all
+    components arrive.
+    """
+
+    def __init__(self, layout):
+        from sglang.srt.ray.weight_sync import ParamLayout
+
+        self.layout: ParamLayout = layout
+        self.recipes = layout.sharding_recipes
+
+        # Precompute concat groups: internal_name -> sorted list of concat_orders
+        self._concat_groups: dict[str, list[int]] = {}
+        for recipe in self.recipes.values():
+            if recipe.concat_group is not None:
+                self._concat_groups.setdefault(recipe.concat_group, []).append(
+                    recipe.concat_order
+                )
+        for group in self._concat_groups.values():
+            group.sort()
+
+        # Accumulator for stacked params: concat_group -> {concat_order: tensor}
+        self._stacked_accum: dict[str, dict[int, torch.Tensor]] = {}
+
+        self._result: list[tuple[str, torch.Tensor]] = []
+
+    def add_hf_tensor(self, hf_name: str, tensor: torch.Tensor) -> None:
+        """Process one HF-named tensor, sharding it per the recipe."""
+        recipe = self.recipes.get(hf_name)
+        if recipe is None:
+            return
+
+        sharded = tensor
+        for op in recipe.narrow_ops:
+            sharded = sharded.narrow(op.dim, op.start, op.length)
+
+        if recipe.concat_group is not None:
+            self._accumulate_stacked(recipe, sharded)
+        else:
+            self._result.append((recipe.internal_name, sharded))
+
+    def _accumulate_stacked(self, recipe, sharded: torch.Tensor) -> None:
+        group = recipe.concat_group
+        if group not in self._stacked_accum:
+            self._stacked_accum[group] = {}
+
+        self._stacked_accum[group][recipe.concat_order] = sharded
+
+        expected_orders = self._concat_groups[group]
+        if len(self._stacked_accum[group]) == len(expected_orders):
+            ordered = [self._stacked_accum[group][o] for o in expected_orders]
+            fused = torch.cat(ordered, dim=0)
+            self._result.append((recipe.internal_name, fused))
+            del self._stacked_accum[group]
+
+    def build(self) -> list[tuple[str, torch.Tensor]]:
+        assert not self._stacked_accum, (
+            f"Incomplete stacked params: {list(self._stacked_accum.keys())}"
+        )
+        result = self._result
+        self._result = []
+        return result
 
 
 class UpdateWeightFromRDT:
@@ -87,10 +160,16 @@ class UpdateWeightFromRDT:
         self.quantization_config = quantization_config
         self.weight_version = 0
         self.scheduler_actors = None
-        self._current_flat_tensor: torch.Tensor | None = None
-        self._current_metadata_json: str | None = None
+        self._self_handle = None
+        self._current_metadata: list | None = None
+        self._current_hf_tensors: list[tuple[str, torch.Tensor]] | None = None
+        self._tp_rank_views: dict[int, list[torch.Tensor]] = {}
         self._persistent_buffer: CudaRawBuffer | None = None
         self._persistent_tensor: torch.Tensor | None = None
+
+        # Populated in connect_rollout_engines: schedulers grouped by TP rank
+        self._schedulers_by_tp: dict[int, list] = {}
+        self._shard_layouts: dict = {}  # tp_rank -> ParamLayout
 
         self._is_pp_src_rank = (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -107,6 +186,10 @@ class UpdateWeightFromRDT:
         self._expert_buffer: list[tuple[str, torch.Tensor]] = []
         self._expert_buffer_size: int = 0
 
+    def set_actor_handle(self, handle) -> None:
+        """Store the trainer's own actor handle for scheduler pull_weights calls."""
+        self._self_handle = handle
+
     def connect_rollout_engines(
         self,
         rollout_engines: Sequence,
@@ -118,6 +201,17 @@ class UpdateWeightFromRDT:
         for engine in rollout_engines:
             actors = ray.get(engine.get_scheduler_actors.remote())
             self.scheduler_actors.extend(actors)
+
+        # Fetch shard configs and group by TP rank (one-time setup)
+        if self.scheduler_actors:
+            layouts = ray.get([a.get_param_layout.remote() for a in self.scheduler_actors])
+            self._schedulers_by_tp = {}
+            self._shard_layouts = {}
+            for actor, layout in zip(self.scheduler_actors, layouts):
+                tp_rank = layout.tp_rank
+                self._schedulers_by_tp.setdefault(tp_rank, []).append(actor)
+                if tp_rank not in self._shard_layouts:
+                    self._shard_layouts[tp_rank] = layout
 
     @torch.no_grad()
     def start_weight_sync(self) -> None:
@@ -287,6 +381,8 @@ class UpdateWeightFromRDT:
         via cudaMalloc and pre-registers it with NIXL. The buffer persists across
         sync cycles for zero-overhead reuse.
         """
+        if min_size <= 0:
+            return
         if self._persistent_buffer is not None and self._persistent_buffer._size >= min_size:
             return  # Already big enough
 
@@ -299,11 +395,57 @@ class UpdateWeightFromRDT:
         ray.experimental.register_nixl_memory(self._persistent_tensor)
 
     def _build_bucket(self, hf_named_tensors: list[tuple[str, torch.Tensor]]) -> None:
-        """Source rank: build flat GPU tensor from converted HF tensors."""
+        """Source rank: save HF tensors for per-TP sharding (packing happens later)."""
         if not self._is_pp_src_rank:
             return
 
-        from sglang.srt.ray.weight_sync import build_metadata_json
+        self._current_hf_tensors = hf_named_tensors
+
+        if self._pbar is not None:
+            self._pbar.update(1)
+
+    def _shard_and_pack_all_tp_ranks(self) -> dict[int, list[str]]:
+        """Shard HF tensors for ALL TP ranks, pack into single flat buffer.
+
+        Returns dict mapping tp_rank -> list of param names.
+        Populates self._tp_rank_views with per-TP-rank tensor view lists.
+        """
+        all_named_tensors: list[tuple[str, torch.Tensor]] = []
+        tp_boundaries: dict[int, tuple[int, int]] = {}  # tp_rank -> (start_index, count)
+
+        for tp_rank in sorted(self._schedulers_by_tp.keys()):
+            layout = self._shard_layouts[tp_rank]
+            builder = RecipeShardedBucketBuilder(layout)
+            for name, tensor in self._current_hf_tensors:
+                builder.add_hf_tensor(name, tensor)
+            presharded = builder.build()
+
+            start = len(all_named_tensors)
+            all_named_tensors.extend(presharded)
+            tp_boundaries[tp_rank] = (start, len(presharded))
+
+        self._pack_into_flat_tensor(all_named_tensors)
+
+        self._tp_rank_views = {}
+        tp_param_names: dict[int, list[str]] = {}
+        for tp_rank, (start, count) in tp_boundaries.items():
+            views = []
+            names = []
+            for i in range(start, start + count):
+                m = self._current_metadata[i]
+                view = self._persistent_tensor[m.start_idx:m.end_idx].view(m.dtype).reshape(m.shape)
+                views.append(view)
+                names.append(m.name)
+            self._tp_rank_views[tp_rank] = views
+            tp_param_names[tp_rank] = names
+
+        return tp_param_names
+
+    def _pack_into_flat_tensor(
+        self,
+        named_tensors: list[tuple[str, torch.Tensor]],
+    ) -> None:
+        """Pack named tensors into the persistent cudaMalloc buffer."""
         from sglang.srt.weight_sync.tensor_bucket import FlattenedTensorMetadata
 
         torch.cuda.empty_cache()
@@ -311,7 +453,7 @@ class UpdateWeightFromRDT:
         # Compute metadata and total byte size
         metadata = []
         current_idx = 0
-        for name, tensor in hf_named_tensors:
+        for name, tensor in named_tensors:
             byte_numel = tensor.numel() * tensor.element_size()
             metadata.append(FlattenedTensorMetadata(
                 name=name,
@@ -326,21 +468,15 @@ class UpdateWeightFromRDT:
         # Ensure persistent cudaMalloc buffer is large enough
         self._ensure_export_buffer(current_idx)
 
-        # Copy HF tensors into the persistent buffer, then take a view
+        # Copy tensors into the persistent buffer, then take a view
         # of exactly the needed size. The view shares the same
         # untyped_storage().data_ptr() → NIXL cache hit, no re-registration.
-        for i, (_name, tensor) in enumerate(hf_named_tensors):
+        for i, (_name, tensor) in enumerate(named_tensors):
             m = metadata[i]
             self._persistent_tensor[m.start_idx:m.end_idx].copy_(
                 tensor.flatten().view(torch.uint8)
             )
-        flat_tensor = self._persistent_tensor[:current_idx]
-
-        self._current_flat_tensor = flat_tensor
-        self._current_metadata_json = build_metadata_json(metadata)
-
-        if self._pbar is not None:
-            self._pbar.update(1)
+        self._current_metadata = metadata
 
     def _gather_expert_params(
         self,
@@ -417,12 +553,34 @@ class UpdateWeightFromRDT:
 
     def cleanup_bucket(self) -> None:
         """Clear refs to current bucket. Persistent buffer stays alive."""
-        self._current_flat_tensor = None
-        self._current_metadata_json = None
+        self._current_metadata = None
+        self._current_hf_tensors = None
+        self._tp_rank_views = {}
 
     # --- Called by the train actor for RDT ---
 
+    @torch.no_grad()
     def update_weights(self) -> None:
-        """Called by all train ranks. Starts weight sync; actual bucket loop
-        is driven by the driver (actor_group.py)."""
+        """Self-contained weight sync: pause, bucket loop, resume.
+
+        The source rank (DP=0, TP=0) drives the bucket loop. For each bucket,
+        it shards HF tensors per TP rank and tells schedulers to pull via RDT.
+        The schedulers call trainer.export_weights_rdt.remote() which runs in
+        the rdt_export concurrency group (so it doesn't deadlock with this task).
+        """
         self.start_weight_sync()
+        while True:
+            if not self.prepare_next_bucket():
+                break
+            if self._is_pp_src_rank:
+                tp_param_names = self._shard_and_pack_all_tp_ranks()
+                all_refs = []
+                for tp_rank, actors in self._schedulers_by_tp.items():
+                    param_names = tp_param_names[tp_rank]
+                    for a in actors:
+                        all_refs.append(
+                            a.pull_weights.remote(self._self_handle, param_names, tp_rank)
+                        )
+                ray.get(all_refs)
+            self.cleanup_bucket()
+        self.finish_weight_sync()
