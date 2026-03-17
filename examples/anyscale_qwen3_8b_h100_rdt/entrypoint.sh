@@ -37,11 +37,12 @@ MODEL_ARGS=(
 )
 
 # ======================== Step 0: Sync local code to shared storage ========================
-# The working_dir is only available on the head node. Copy local sglang/miles
+# The working_dir is only available on the head node. Copy local sglang/miles/ray
 # source to shared storage so GPU workers can overlay them at runtime.
-echo "=== Syncing local sglang/miles to shared storage ==="
+echo "=== Syncing local sglang/miles/ray to shared storage ==="
 mkdir -p ${CODE_DIR}
 rsync -a --delete _bundled/sglang_python/ ${CODE_DIR}/sglang_python/
+rsync -a --delete _bundled/ray_python/ ${CODE_DIR}/ray_python/
 rsync -a --delete miles/ ${CODE_DIR}/miles/
 cp train_async.py ${CODE_DIR}/train_async.py
 
@@ -50,6 +51,17 @@ cat > ${CODE_DIR}/run_training_rdt.sh << 'WRAPPER'
 #!/bin/bash
 set -ex
 CODE_DIR=/mnt/cluster_storage/local_code
+
+# Overlay local ray Python code onto Docker-installed version
+RAY_PATH=$(python3 -c "import ray, os; print(os.path.dirname(ray.__file__))")
+# Only overlay pure-Python modules; leave compiled _raylet.so etc. intact
+for subdir in experimental _private core dag; do
+    if [ -d "${CODE_DIR}/ray_python/ray/${subdir}" ]; then
+        rm -rf "$RAY_PATH/${subdir}" && cp -r ${CODE_DIR}/ray_python/ray/${subdir} "$RAY_PATH/${subdir}"
+    fi
+done
+# Overlay top-level .py files (actor.py, __init__.py, etc.)
+find ${CODE_DIR}/ray_python/ray/ -maxdepth 1 -name '*.py' -exec cp -f {} "$RAY_PATH/" \;
 
 # Overlay local sglang onto Docker-installed version
 SGLANG_PATH=$(python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))")
@@ -70,7 +82,7 @@ pip install --no-cache-dir -q nixl
 MILES_PATH=$(python3 -c "import miles, os; print(os.path.dirname(miles.__file__))")
 rm -rf "$MILES_PATH" && cp -r ${CODE_DIR}/miles/ "$MILES_PATH/"
 
-echo "=== Local sglang/miles overlaid ==="
+echo "=== Local ray/sglang/miles overlaid ==="
 exec python3 ${CODE_DIR}/train_async.py "$@"
 WRAPPER
 chmod +x ${CODE_DIR}/run_training_rdt.sh
@@ -89,7 +101,7 @@ if [ ! -d "${STORAGE}/Qwen3-8B_torch_dist/iter_0000000" ]; then
   echo "=== Converting weights (HF -> torch_dist) on GPU worker ==="
   CONVERT_ENV_JSON='{
     "env_vars": {
-      "PYTHONPATH": "/root/Megatron-LM/"
+      "PYTHONPATH": "/home/ray/Megatron-LM/"
     }
   }'
   ray job submit --address="http://127.0.0.1:8265" \
@@ -144,7 +156,7 @@ PERF_ARGS=(
    --recompute-num-layers 1
 
    --use-dynamic-batch-size
-   --max-tokens-per-gpu 9216
+   --max-tokens-per-gpu 4096
 )
 
 GRPO_ARGS=(
@@ -188,7 +200,7 @@ MISC_ARGS=(
 
 RUNTIME_ENV_JSON='{
   "env_vars": {
-    "PYTHONPATH": "/root/Megatron-LM/",
+    "PYTHONPATH": "/home/ray/Megatron-LM/",
     "CUDA_DEVICE_MAX_CONNECTIONS": "1",
     "TENSORBOARD_DIR": "/mnt/cluster_storage/tensorboard_logs",
     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
