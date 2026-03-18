@@ -556,8 +556,7 @@ class FSDPTrainRayActor(TrainRayActor):
             if dist.get_rank() == 0:
                 ray.get(self.rollout_manager.clear_num_new_engines.remote())
 
-        with timer("update_weights_transfer"):
-            self.weight_updater.update_weights()
+        self.weight_updater.update_weights()
 
         if self.args.ci_test and len(rollout_engines) > 0:
             engine = random.choice(rollout_engines)
