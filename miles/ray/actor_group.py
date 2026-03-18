@@ -47,7 +47,7 @@ class RayTrainGroup:
 
         # Use placement group to lock resources for models of same type
         assert pg is not None
-        pg, reordered_bundle_indices, reordered_gpu_ids = pg
+        pg, reordered_bundle_indices, _reordered_gpu_ids = pg
 
         env_vars = {
             # because sglang will always set NCCL_CUMEM_ENABLE to 0

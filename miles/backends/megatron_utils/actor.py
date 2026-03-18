@@ -518,7 +518,10 @@ class MegatronTrainRayActor(TrainRayActor):
             if getattr(self.args, "keep_old_actor", False):
                 if self.args.update_weights_interval == 1:
                     logger.info("updating model queue: rollout_actor -> old_actor, actor -> rollout_actor")
+                    # Queue-style update: rollout_actor params -> old_actor, actor params -> rollout_actor
+                    # First copy rollout_actor to old_actor
                     self.weights_backuper.copy(src_tag="rollout_actor", dst_tag="old_actor")
+                    # Then copy current actor to rollout_actor
                     self.weights_backuper.backup("rollout_actor")
                 else:
                     self.weights_backuper.backup("old_actor")
