@@ -227,7 +227,7 @@ class UpdateWeightFromRDT:
         for tp_rank, actors in self._schedulers_by_tp.items():
             weights_ref = ray.put(self._tp_rank_views[tp_rank], _tensor_transport="nixl")
             for actor in actors:
-                all_refs.append(actor.pull_weights.remote(weights_ref, tp_param_names[tp_rank]))
+                all_refs.append(actor.pull_weights.remote([weights_ref], tp_param_names[tp_rank]))
         ray.get(all_refs)
         self._tp_rank_views = {}
 

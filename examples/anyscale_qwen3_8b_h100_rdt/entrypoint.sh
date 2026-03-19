@@ -55,9 +55,17 @@ CODE_DIR=/mnt/cluster_storage/local_code
 # Overlay local ray Python code onto Docker-installed version
 RAY_PATH=$(python3 -c "import ray, os; print(os.path.dirname(ray.__file__))")
 # Only overlay pure-Python modules; leave compiled _raylet.so etc. intact
-for subdir in experimental _private core dag; do
+for subdir in experimental _private _common core dag; do
     if [ -d "${CODE_DIR}/ray_python/ray/${subdir}" ]; then
+        # Preserve compiled/generated dirs (e.g. core/generated with protobufs)
+        if [ -d "$RAY_PATH/${subdir}/generated" ]; then
+            mv "$RAY_PATH/${subdir}/generated" /tmp/_ray_generated_${subdir}
+        fi
         rm -rf "$RAY_PATH/${subdir}" && cp -r ${CODE_DIR}/ray_python/ray/${subdir} "$RAY_PATH/${subdir}"
+        if [ -d /tmp/_ray_generated_${subdir} ]; then
+            cp -rn /tmp/_ray_generated_${subdir} "$RAY_PATH/${subdir}/generated"
+            rm -rf /tmp/_ray_generated_${subdir}
+        fi
     fi
 done
 # Overlay top-level .py files (actor.py, __init__.py, etc.)
