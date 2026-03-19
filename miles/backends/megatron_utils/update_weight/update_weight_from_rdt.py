@@ -124,9 +124,7 @@ class UpdateWeightFromRDT:
         self._schedulers_by_tp: dict[int, list[ActorHandle]] = {}
         self._shard_layouts: dict[int, ParamLayout] = {}
 
-        self._is_pp_src_rank = (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
-        )
+        self._is_tp_rank_zero = mpu.get_tensor_model_parallel_rank() == 0
 
     def connect_rollout_engines(
         self,
@@ -150,49 +148,6 @@ class UpdateWeightFromRDT:
                 self._schedulers_by_tp.setdefault(tp_rank, []).append(actor)
                 if tp_rank not in self._shard_layouts:
                     self._shard_layouts[tp_rank] = layout
-
-    def _gather_expert_params(
-        self,
-        named_tensors: list[tuple[str, torch.Tensor]],
-    ) -> list[tuple[str, torch.Tensor]]:
-        """EP all-gather + HF convert for expert parameters."""
-        ep_group = mpu.get_expert_model_parallel_group()
-        ep_size = mpu.get_expert_model_parallel_world_size()
-
-        # Step 1: Gather names from all EP ranks
-        local_names = [name for name, _ in named_tensors]
-        all_ep_names = [None] * ep_size
-        dist.all_gather_object(all_ep_names, local_names, group=ep_group)
-
-        # Step 2: Async all-gather tensors
-        gathered_tensors = []  # gathered_tensors[i][ep_rank] = tensor
-        handles = []
-        for _, param in named_tensors:
-            buffers = [torch.empty_like(param.data, device=torch.cuda.current_device()) for _ in range(ep_size)]
-            handles.append(dist.all_gather(buffers, param.data, group=ep_group, async_op=True))
-            gathered_tensors.append(buffers)
-
-        # Step 3: Wait for all transfers
-        for h in handles:
-            h.wait()
-
-        if not self._is_pp_src_rank:
-            return []
-
-        # Step 4: Pair names with tensors, convert to HF
-        hf_tensors = []
-        for ep_rank in range(ep_size):
-            for i, name in enumerate(all_ep_names[ep_rank]):
-                hf_tensors.extend(
-                    convert_to_hf(
-                        self.args,
-                        self.model_name,
-                        name,
-                        gathered_tensors[i][ep_rank],
-                        self.quantization_config,
-                    )
-                )
-        return hf_tensors
 
     @torch.no_grad()
     def resume_engines(self) -> None:
@@ -235,21 +190,16 @@ class UpdateWeightFromRDT:
 
     def _gather_and_shard_all_params(self) -> dict[int, RecipeShardedBucketBuilder] | None:
         builders = None
-        if self._is_pp_src_rank:
+        if self._is_tp_rank_zero:
             builders = {
                 tp_rank: RecipeShardedBucketBuilder(self._shard_layouts[tp_rank])
                 for tp_rank in sorted(self._schedulers_by_tp.keys())
             }
 
-        pbar = tqdm(desc="[RDT] Update weights") if self._is_pp_src_rank else None
-        expert_params = []
+        pbar = tqdm(desc="[RDT] Update weights") if self._is_tp_rank_zero else None
 
         for name, param in named_params_and_buffers(self.args, self.model):
             gathered = all_gather_param(self.args, name, param)
-
-            if ".experts." in name:
-                expert_params.append((name, gathered))
-                continue
 
             if builders is not None:
                 self._feed_hf_tensors_to_builders(
@@ -259,13 +209,6 @@ class UpdateWeightFromRDT:
             if pbar is not None:
                 pbar.update(1)
 
-        dist.barrier(group=get_gloo_group())
-        if expert_params:
-            hf_tensors = self._gather_expert_params(expert_params)
-            if builders is not None and hf_tensors:
-                self._feed_hf_tensors_to_builders(builders, hf_tensors)
-            if pbar is not None:
-                pbar.update(len(expert_params))
         dist.barrier(group=get_gloo_group())
 
         if pbar is not None:
