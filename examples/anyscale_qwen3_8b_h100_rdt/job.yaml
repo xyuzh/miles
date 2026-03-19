@@ -13,7 +13,7 @@ cloud:
 
 name: miles-qwen3-8b-grpo-h100
 
-containerfile: examples/anyscale_qwen3_8b_h100/Dockerfile.anyscale
+containerfile: examples/anyscale_qwen3_8b_h100_rdt/Dockerfile.anyscale
 
 compute_config:
   head_node:
