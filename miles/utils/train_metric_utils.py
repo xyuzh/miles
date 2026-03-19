@@ -2,33 +2,12 @@ import logging
 from argparse import Namespace
 from collections.abc import Callable
 from copy import deepcopy
-from functools import lru_cache
-
-import torch
 
 from miles.utils import tracking_utils
 from miles.utils.metric_utils import compute_rollout_step
 from miles.utils.timer import Timer
 
 logger = logging.getLogger(__name__)
-
-_GPU_PEAK_BF16_TFLOPS = {
-    "H100": 989.0,
-    "H200": 989.0,
-    "A100": 312.0,
-    "A800": 312.0,
-}
-
-
-@lru_cache(maxsize=1)
-def _get_peak_tflops() -> float | None:
-    if not torch.cuda.is_available():
-        return None
-    gpu_name = torch.cuda.get_device_name(0).upper()
-    for key, val in _GPU_PEAK_BF16_TFLOPS.items():
-        if key in gpu_name:
-            return val
-    return None
 
 
 def log_perf_data_raw(
@@ -55,15 +34,6 @@ def log_perf_data_raw(
         if log_dict["perf/actor_train_time"] > 0:
             log_dict["perf/actor_train_tflops"] = 3 * total_fwd_flops / log_dict["perf/actor_train_time"]
             log_dict["perf/actor_train_tok_per_s"] = sum(timer_instance.seq_lens) / log_dict["perf/actor_train_time"]
-
-            peak_tflops = _get_peak_tflops()
-            if peak_tflops is not None:
-                log_dict["perf/actor_train_mfu"] = log_dict["perf/actor_train_tflops"] / peak_tflops
-
-    if "perf/update_weights_time" in log_dict and "perf/update_weights_transfer_time" in log_dict:
-        log_dict["perf/update_weights_overhead_time"] = (
-            log_dict["perf/update_weights_time"] - log_dict["perf/update_weights_transfer_time"]
-        )
 
     if "perf/train_wait_time" in log_dict and "perf/train_time" in log_dict:
         total_time = log_dict["perf/train_wait_time"] + log_dict["perf/train_time"]
