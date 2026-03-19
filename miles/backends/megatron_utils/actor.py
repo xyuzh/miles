@@ -150,9 +150,6 @@ class MegatronTrainRayActor(TrainRayActor):
             is_lora=is_lora_enabled(args),
         )
 
-        if isinstance(self.weight_updater, UpdateWeightFromRDT):
-            self.weight_updater.set_actor_handle(ray.get_runtime_context().current_actor)
-
         # empty cache after initialization
         clear_memory()
 
@@ -530,15 +527,6 @@ class MegatronTrainRayActor(TrainRayActor):
             if is_lora_enabled(self.args):
                 torch_memory_saver.pause()
             destroy_process_groups()
-
-    # ------------------------------------------------------------------
-    # RDT weight export (called by driver via .remote())
-    # ------------------------------------------------------------------
-
-    @ray.method(concurrency_group="rdt_export", tensor_transport="nixl")
-    def export_weights_rdt(self, tp_rank: int) -> list:
-        """Export prepared weight bucket for a specific TP rank via RDT/NIXL."""
-        return self.weight_updater._tp_rank_views[tp_rank]
 
     def load_other_checkpoint(self, model_tag: str, path: str) -> None:
         old_args = self.args.load, self.args.no_load_optim, self.args.no_load_rng, self.args.finetune
