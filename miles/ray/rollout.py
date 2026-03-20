@@ -487,7 +487,21 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             num_engines > prefill_num_servers
         ), f"num_engines {num_engines} should be larger than prefill_num_servers {prefill_num_servers}"
 
-    pg, reordered_bundle_indices, reordered_gpu_ids = pg
+    use_rdt = pg is None  # RDT mode: rollout GPUs excluded from main PG
+
+    if use_rdt:
+        # Create per-engine placement groups for sglang RayEngine
+        from ray.util.placement_group import placement_group as create_pg
+
+        engine_pgs = {}
+        for i in range(num_engines):
+            if all_rollout_engines[i] is not None:
+                continue
+            bundles = [{"GPU": 1, "CPU": 1}] * num_gpu_per_engine
+            engine_pgs[i] = create_pg(bundles, strategy="STRICT_PACK")
+        ray.get([epg.ready() for epg in engine_pgs.values()])
+    else:
+        pg, reordered_bundle_indices, reordered_gpu_ids = pg
 
     RolloutRayActor = ray.remote(SGLangEngine)
 
@@ -495,18 +509,6 @@ def init_rollout_engines(args, pg, all_rollout_engines):
     for i in range(num_engines):
         if all_rollout_engines[i] is not None:
             continue
-
-        num_gpus = 0.2
-        num_cpus = num_gpus
-
-        # Get the base GPU ID from placement group
-        base_gpu_id = int(reordered_gpu_ids[i * num_gpu_per_engine])
-
-        scheduling_strategy = PlacementGroupSchedulingStrategy(
-            placement_group=pg,
-            placement_group_capture_child_tasks=True,
-            placement_group_bundle_index=reordered_bundle_indices[i * num_gpu_per_engine],
-        )
 
         env_vars = {name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST} | {
             "SGL_JIT_DEEPGEMM_PRECOMPILE": "false",
@@ -527,14 +529,33 @@ def init_rollout_engines(args, pg, all_rollout_engines):
             else:
                 worker_type = "decode"
 
-        rollout_engine = RolloutRayActor.options(
-            num_cpus=num_cpus,
-            num_gpus=num_gpus,
-            scheduling_strategy=scheduling_strategy,
-            runtime_env={
-                "env_vars": env_vars,
-            },
-        ).remote(args, rank=i, worker_type=worker_type, base_gpu_id=base_gpu_id)
+        if use_rdt:
+            scheduling_strategy = PlacementGroupSchedulingStrategy(
+                placement_group=engine_pgs[i],
+                placement_group_bundle_index=0,
+                placement_group_capture_child_tasks=True,
+            )
+            rollout_engine = RolloutRayActor.options(
+                num_cpus=0,
+                num_gpus=0,
+                scheduling_strategy=scheduling_strategy,
+                runtime_env={"env_vars": env_vars},
+            ).remote(args, rank=i, worker_type=worker_type, base_gpu_id=None)
+        else:
+            num_gpus = 0.2
+            num_cpus = num_gpus
+            base_gpu_id = int(reordered_gpu_ids[i * num_gpu_per_engine])
+            scheduling_strategy = PlacementGroupSchedulingStrategy(
+                placement_group=pg,
+                placement_group_capture_child_tasks=True,
+                placement_group_bundle_index=reordered_bundle_indices[i * num_gpu_per_engine],
+            )
+            rollout_engine = RolloutRayActor.options(
+                num_cpus=num_cpus,
+                num_gpus=num_gpus,
+                scheduling_strategy=scheduling_strategy,
+                runtime_env={"env_vars": env_vars},
+            ).remote(args, rank=i, worker_type=worker_type, base_gpu_id=base_gpu_id)
 
         rollout_engines.append((i, rollout_engine))
         all_rollout_engines[i] = rollout_engine

@@ -4,11 +4,30 @@ Trainer all-gathers params, converts to HF format, assembles stacked
 params using recipes from sglang, and exports via RDT/NIXL.
 SchedulerActors pull concurrently via RDMA into model param buffers.
 
-Lifecycle:
+Lifecycle & memory:
+
     1. Pause engines, flush cache
-    2. Iterate all params: all-gather -> convert to HF -> assemble via recipes
+       No tensor work. Rank 0 sends Ray RPCs; all ranks barrier.
+
+    2. Iterate all params: all-gather → convert to HF → assemble via recipes
+       Per param, on every TP rank:
+         all_gather_param   – alloc tp_size buffers, NCCL fills them [copy]
+                            – torch.cat partitions → full tensor   [copy]
+       On tp_rank_zero only:
+         convert_to_hf      – remove_padding: view (no copy)
+                            – model-specific transform: may split/transpose [copy, model-dependent]
+                            – quantize_params: new dtype tensor    [copy if enabled]
+         assemble stacked   – accumulate refs per concat_group (no copy)
+                            – torch.cat fuse when group complete   [copy]
+       Peak: one full-size gathered param + its HF conversion live at a time.
+
     3. Transfer tensors to all scheduler actors via RDT
+       .contiguous() on each tensor          [copy if non-contiguous view]
+       ray.put via NIXL into shared memory  
+       scheduler RDMA pull into param buffers [copy over network]
+
     4. Resume engines, post-process quantization
+       No tensor work. Rank 0 sends Ray RPCs; all ranks barrier.
 """
 
 from __future__ import annotations
