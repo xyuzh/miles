@@ -86,10 +86,6 @@ class RayTrainGroup:
             actor_impl = FSDPTrainRayActor
 
         remote_kwargs = {"num_gpus": 1, "runtime_env": {"env_vars": env_vars}}
-        if getattr(self.args, "use_rdt_weight_sync", False):
-            rdt_tp_size = getattr(self.args, "rollout_num_gpus_per_engine", 1)
-            remote_kwargs["max_concurrency"] = 1 + rdt_tp_size
-            remote_kwargs["concurrency_groups"] = {"rdt_export": rdt_tp_size}
         TrainRayActor = ray.remote(**remote_kwargs)(actor_impl)
 
         # Create worker actors
