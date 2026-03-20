@@ -63,7 +63,8 @@ rm -rf "$SGLANG_PATH/srt" && cp -r ${CODE_DIR}/sglang_python/sglang/srt "$SGLANG
 if [ -d "${CODE_DIR}/sglang_python/sglang/jit_kernel" ]; then
     rm -rf "$SGLANG_PATH/jit_kernel" && cp -r ${CODE_DIR}/sglang_python/sglang/jit_kernel "$SGLANG_PATH/jit_kernel"
 fi
-# Also overlay utils.py (needed for _prebind_listening_socket etc.)
+# Also overlay top-level .py files (launch_server.py for use_ray, utils.py, etc.)
+cp -f ${CODE_DIR}/sglang_python/sglang/launch_server.py "$SGLANG_PATH/launch_server.py"
 cp -f ${CODE_DIR}/sglang_python/sglang/utils.py "$SGLANG_PATH/utils.py"
 
 # Upgrade flashinfer to match local sglang's requirements

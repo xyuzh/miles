@@ -3,7 +3,6 @@ import ipaddress
 import logging
 import multiprocessing
 import os
-import threading
 import time
 from urllib.parse import quote
 
@@ -183,30 +182,13 @@ class SGLangEngine(RayActor):
 
     def _init_normal(self, server_args_dict):
         use_rdt = getattr(self.args, "use_rdt_weight_sync", False)
+        if use_rdt:
+            server_args_dict["use_ray"] = True
         logger.info(
             f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}"
             f"{' (use_ray=True for RDT)' if use_rdt else ''}"
         )
-        if use_rdt:
-            from sglang.srt.ray.engine import launch_server_with_ray_schedulers
-
-            server_args = ServerArgs(**server_args_dict)
-            server_args.host = server_args.host.strip("[]")
-            multiprocessing.set_start_method("spawn", force=True)
-            p = multiprocessing.Process(
-                target=launch_server_with_ray_schedulers,
-                args=(server_args,),
-            )
-            p.start()
-            self.process = p
-            if server_args.node_rank == 0:
-                _wait_server_healthy(
-                    base_url=server_args.url(),
-                    api_key=server_args.api_key,
-                    is_process_alive=lambda: p.is_alive(),
-                )
-        else:
-            self.process = launch_server_process(ServerArgs(**server_args_dict))
+        self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
