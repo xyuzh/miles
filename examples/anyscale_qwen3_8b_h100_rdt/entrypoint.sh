@@ -52,24 +52,10 @@ cat > ${CODE_DIR}/run_training_rdt.sh << 'WRAPPER'
 set -ex
 CODE_DIR=/mnt/cluster_storage/local_code
 
-# Overlay local ray Python code onto Docker-installed version
-RAY_PATH=$(python3 -c "import ray, os; print(os.path.dirname(ray.__file__))")
-# Only overlay pure-Python modules; leave compiled _raylet.so etc. intact
-for subdir in experimental _private _common core dag; do
-    if [ -d "${CODE_DIR}/ray_python/ray/${subdir}" ]; then
-        # Preserve compiled/generated dirs (e.g. core/generated with protobufs)
-        if [ -d "$RAY_PATH/${subdir}/generated" ]; then
-            mv "$RAY_PATH/${subdir}/generated" /tmp/_ray_generated_${subdir}
-        fi
-        rm -rf "$RAY_PATH/${subdir}" && cp -r ${CODE_DIR}/ray_python/ray/${subdir} "$RAY_PATH/${subdir}"
-        if [ -d /tmp/_ray_generated_${subdir} ]; then
-            cp -rn /tmp/_ray_generated_${subdir} "$RAY_PATH/${subdir}/generated"
-            rm -rf /tmp/_ray_generated_${subdir}
-        fi
-    fi
-done
-# Overlay top-level .py files (actor.py, __init__.py, etc.)
-find ${CODE_DIR}/ray_python/ray/ -maxdepth 1 -name '*.py' -exec cp -f {} "$RAY_PATH/" \;
+# Skip Ray overlay — Docker's Ray 2.54.0 already has RDT/NIXL support.
+# Overlaying local Ray 3.0.0.dev0 Python code onto 2.54.0 compiled extensions
+# causes ABI mismatches (rdt_manager, temp_dir, env_bool, etc.).
+echo "=== Skipping Ray overlay (using Docker Ray 2.54.0) ==="
 
 # Overlay local sglang onto Docker-installed version
 SGLANG_PATH=$(python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))")

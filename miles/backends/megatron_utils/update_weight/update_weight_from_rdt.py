@@ -1,13 +1,13 @@
 """
-Update SchedulerActor engines via RDT/NIXL.
-Trainer all-gathers params, converts to HF format, shards per TP rank
-using recipes from sglang, and exports via @ray.method(tensor_transport="nixl").
+Update SchedulerActor engines via RDT/NIXL (assumes inference TP=1).
+Trainer all-gathers params, converts to HF format, assembles stacked
+params using recipes from sglang, and exports via RDT/NIXL.
 SchedulerActors pull concurrently via RDMA into model param buffers.
 
 Lifecycle:
     1. Pause engines, flush cache
-    2. Iterate all params: all-gather -> convert to HF -> shard per TP rank
-    3. Transfer sharded tensors to all scheduler actors via RDT
+    2. Iterate all params: all-gather -> convert to HF -> assemble via recipes
+    3. Transfer tensors to all scheduler actors via RDT
     4. Resume engines, post-process quantization
 """
 
@@ -35,12 +35,10 @@ if TYPE_CHECKING:
 
 
 class RecipeShardedBucketBuilder:
-    """Builds pre-sharded weight tensors using sharding recipes from sglang.
+    """Assembles internal model params from HF tensors using sharding recipes.
 
-    Each recipe describes exactly which narrow() ops to apply to a full HF
-    tensor to produce the shard for a specific TP rank.  Stacked params
-    (QKV, gate_up) are accumulated by concat_group and fused once all
-    components arrive.
+    With tp=1, no narrow/slicing is needed.  Stacked params (QKV, gate_up)
+    are accumulated by concat_group and fused once all components arrive.
     """
 
     def __init__(self, layout: ParamLayout) -> None:
@@ -61,19 +59,15 @@ class RecipeShardedBucketBuilder:
         self._result: list[tuple[str, torch.Tensor]] = []
 
     def add_hf_tensor(self, hf_name: str, tensor: torch.Tensor) -> None:
-        """Process one HF-named tensor, sharding it per the recipe."""
+        """Process one HF-named tensor per the recipe (tp=1, no narrow ops)."""
         recipe = self.recipes.get(hf_name)
         if recipe is None:
             return
 
-        sharded = tensor
-        for op in recipe.narrow_ops:
-            sharded = sharded.narrow(op.dim, op.start, op.length)
-
         if recipe.concat_group is not None:
-            self._accumulate_stacked(recipe, sharded)
+            self._accumulate_stacked(recipe, tensor)
         else:
-            self._result.append((recipe.internal_name, sharded))
+            self._result.append((recipe.internal_name, tensor))
 
     def _accumulate_stacked(self, recipe: ParamShardingRecipe, sharded: torch.Tensor) -> None:
         group = recipe.concat_group
@@ -111,18 +105,16 @@ class UpdateWeightFromRDT:
         *,
         model_name: str,
         quantization_config: dict[str, int | str | list[str]] | None,
+        is_lora: bool = False,
     ) -> None:
         self.args = args
         self.model = model
         self.model_name = model_name
         self.quantization_config = quantization_config
         self.weight_version = 0
-        self.scheduler_actors: list[ActorHandle] | None = None
-        self._tp_rank_views: dict[int, list[torch.Tensor]] = {}
-
-        # Populated in connect_rollout_engines: schedulers grouped by TP rank
-        self._schedulers_by_tp: dict[int, list[ActorHandle]] = {}
-        self._shard_layouts: dict[int, ParamLayout] = {}
+        self._scheduler_actors: list[ActorHandle] = []
+        self._layout: ParamLayout | None = None
+        self._tensor_views: list[torch.Tensor] = []
 
         self._is_tp_rank_zero = mpu.get_tensor_model_parallel_rank() == 0
 
@@ -133,21 +125,14 @@ class UpdateWeightFromRDT:
     ) -> None:
         """Store rollout engines and extract SchedulerActor handles for RDT."""
         self.rollout_engines = rollout_engines
-        self.scheduler_actors = []
+        self._scheduler_actors = []
         for engine in rollout_engines:
             actors = ray.get(engine.get_scheduler_actors.remote())
-            self.scheduler_actors.extend(actors)
+            self._scheduler_actors.extend(actors)
 
-        # Fetch shard configs and group by TP rank (one-time setup)
-        if self.scheduler_actors:
-            layouts = ray.get([a.get_param_layout.remote() for a in self.scheduler_actors])
-            self._schedulers_by_tp = {}
-            self._shard_layouts = {}
-            for actor, layout in zip(self.scheduler_actors, layouts):
-                tp_rank = layout.tp_rank
-                self._schedulers_by_tp.setdefault(tp_rank, []).append(actor)
-                if tp_rank not in self._shard_layouts:
-                    self._shard_layouts[tp_rank] = layout
+        # Fetch layout from the first scheduler (all are identical with tp=1)
+        if self._scheduler_actors:
+            self._layout = ray.get(self._scheduler_actors[0].get_param_layout.remote())
 
     @torch.no_grad()
     def resume_engines(self) -> None:
@@ -167,14 +152,13 @@ class UpdateWeightFromRDT:
 
     # --- Called by the train actor for RDT ---
 
-    def _feed_hf_tensors_to_builders(
+    def _feed_hf_tensors_to_builder(
         self,
-        builders: dict[int, RecipeShardedBucketBuilder],
+        builder: RecipeShardedBucketBuilder,
         hf_tensors: list[tuple[str, torch.Tensor]],
     ) -> None:
         for hf_name, tensor in hf_tensors:
-            for builder in builders.values():
-                builder.add_hf_tensor(hf_name, tensor)
+            builder.add_hf_tensor(hf_name, tensor)
 
     def _pause_engines(self) -> None:
         if dist.get_rank() == 0:
@@ -188,22 +172,19 @@ class UpdateWeightFromRDT:
                 )
         dist.barrier(group=get_gloo_group())
 
-    def _gather_and_shard_all_params(self) -> dict[int, RecipeShardedBucketBuilder] | None:
-        builders = None
+    def _gather_and_shard_all_params(self) -> RecipeShardedBucketBuilder | None:
+        builder = None
         if self._is_tp_rank_zero:
-            builders = {
-                tp_rank: RecipeShardedBucketBuilder(self._shard_layouts[tp_rank])
-                for tp_rank in sorted(self._schedulers_by_tp.keys())
-            }
+            builder = RecipeShardedBucketBuilder(self._layout)
 
         pbar = tqdm(desc="[RDT] Update weights") if self._is_tp_rank_zero else None
 
         for name, param in named_params_and_buffers(self.args, self.model):
             gathered = all_gather_param(self.args, name, param)
 
-            if builders is not None:
-                self._feed_hf_tensors_to_builders(
-                    builders,
+            if builder is not None:
+                self._feed_hf_tensors_to_builder(
+                    builder,
                     convert_to_hf(self.args, self.model_name, name, gathered, self.quantization_config),
                 )
             if pbar is not None:
@@ -213,30 +194,26 @@ class UpdateWeightFromRDT:
 
         if pbar is not None:
             pbar.close()
-        return builders
+        return builder
 
-    def _transfer_to_schedulers(self, builders: dict[int, RecipeShardedBucketBuilder]) -> None:
-        self._tp_rank_views = {}
-        tp_param_names = {}
-        for tp_rank, builder in builders.items():
-            presharded = builder.build()
-            tp_param_names[tp_rank] = [name for name, _ in presharded]
-            self._tp_rank_views[tp_rank] = [t.contiguous() for _, t in presharded]
+    def _transfer_to_schedulers(self, builder: RecipeShardedBucketBuilder) -> None:
+        presharded = builder.build()
+        param_names = [name for name, _ in presharded]
+        self._tensor_views = [t.contiguous() for _, t in presharded]
 
+        weights_ref = ray.put(self._tensor_views, _tensor_transport="nixl")
         all_refs = []
-        for tp_rank, actors in self._schedulers_by_tp.items():
-            weights_ref = ray.put(self._tp_rank_views[tp_rank], _tensor_transport="nixl")
-            for actor in actors:
-                all_refs.append(actor.pull_weights.remote([weights_ref], tp_param_names[tp_rank]))
+        for actor in self._scheduler_actors:
+            all_refs.append(actor.pull_weights.remote([weights_ref], param_names))
         ray.get(all_refs)
-        self._tp_rank_views = {}
+        self._tensor_views = []
 
     @torch.no_grad()
     def update_weights(self) -> None:
         """Weight sync: pause, gather+shard all params, transfer via RDT, resume."""
         self.weight_version += 1
         self._pause_engines()
-        builders = self._gather_and_shard_all_params()
-        if builders is not None:
-            self._transfer_to_schedulers(builders)
+        builder = self._gather_and_shard_all_params()
+        if builder is not None:
+            self._transfer_to_schedulers(builder)
         self.resume_engines()
