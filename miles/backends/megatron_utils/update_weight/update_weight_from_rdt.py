@@ -216,6 +216,12 @@ class UpdateWeightFromRDT:
         return builder
 
     def _transfer_to_schedulers(self, builder: RecipeShardedBucketBuilder) -> None:
+        # TODO: optimize by transferring in buckets to overlap all-gather/convert
+        # with NIXL transfer. Currently we gather ALL params first, then transfer
+        # ALL at once. Bucketed approach: transfer bucket N while gathering N+1.
+        # Also: pre-allocate output buffers in the builder and register with
+        # ray.experimental.register_nixl_memory() to avoid per-update allocation
+        # and NIXL registration overhead.
         presharded = builder.build()
         param_names = [name for name, _ in presharded]
         self._tensor_views = [t.contiguous() for _, t in presharded]

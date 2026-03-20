@@ -377,7 +377,17 @@ class SGLangEngine(RayActor):
 
             if response is not None:
                 response.raise_for_status()
-        kill_process_tree(self.process.pid)
+        if self.process is not None:
+            kill_process_tree(self.process.pid)
+        else:
+            # RDT mode: kill scheduler actors
+            import ray
+
+            for actor in self._scheduler_actors:
+                try:
+                    ray.kill(actor)
+                except Exception:
+                    pass
 
     def get_weight_version(self):
         if self.node_rank != 0:
