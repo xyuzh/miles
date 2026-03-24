@@ -84,6 +84,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--use-rdt-weight-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable RDT/NIXL weight sync. When set, weights are transferred from "
+                    "trainer to rollout engines via Ray Direct Transport (NIXL RDMA) instead "
+                    "of NCCL broadcast. Requires sglang use_ray=True. No NCCL groups or "
+                    "lock needed — NIXL is point-to-point."
+                ),
+            )
+            parser.add_argument(
                 "--offload",
                 action="store_true",
                 default=False,
@@ -1858,11 +1869,7 @@ def hf_validate_args(args, hf_config):
         ("num_hidden_layers", "num_layers", equal),
         ("intermediate_size", "ffn_hidden_size", equal),
         ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
-        (
-            "rms_norm_eps",
-            "norm_epsilon" if os.getenv("DEPRECATED_MEGATRON_COMPATIBLE", "0") == "1" else "layernorm_epsilon",
-            equal,
-        ),
+        ("rms_norm_eps", "norm_epsilon", equal),
         ("rope_theta", "rotary_base", equal),
     ]:
         if hasattr(hf_config, hf_config_name):

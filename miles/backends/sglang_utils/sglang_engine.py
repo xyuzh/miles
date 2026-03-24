@@ -3,6 +3,7 @@ import ipaddress
 import logging
 import multiprocessing
 import os
+import threading
 import time
 from urllib.parse import quote
 
@@ -71,6 +72,7 @@ def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
     return p
 
 
+
 def _wait_server_healthy(base_url, api_key, is_process_alive):
     headers = {
         "Content-Type": "application/json; charset=utf-8",
@@ -113,6 +115,7 @@ class SGLangEngine(RayActor):
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
+        self._scheduler_actors = []
 
     def init(self, dist_init_addr, port, nccl_port, host=None, disaggregation_bootstrap_port=None):
         self.router_ip = self.args.sglang_router_ip
@@ -180,8 +183,33 @@ class SGLangEngine(RayActor):
         _sanity_check_server_args(actual_server_args, expect_server_args)
 
     def _init_normal(self, server_args_dict):
-        logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+        use_rdt = getattr(self.args, "use_rdt_weight_sync", False)
+        if use_rdt:
+            server_args_dict["use_ray"] = True
+        logger.info(
+            f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}"
+            f"{' (use_ray=True for RDT)' if use_rdt else ''}"
+        )
+
+        if use_rdt:
+            # SGLangEngine actor is on a per-engine PG (created in init_rollout_engines).
+            # Launch sglang's ray HTTP server in a thread — it inherits PG context.
+            from sglang.srt.ray.http_server import launch_server as launch_server_ray
+
+            server_args = ServerArgs(**server_args_dict)
+            self.process = None
+
+            self._server_thread = threading.Thread(
+                target=launch_server_ray, args=(server_args,), daemon=True
+            )
+            self._server_thread.start()
+            _wait_server_healthy(
+                base_url=server_args.url(),
+                api_key=server_args.api_key,
+                is_process_alive=lambda: self._server_thread.is_alive(),
+            )
+        else:
+            self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
             if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_miles_router:
@@ -350,7 +378,17 @@ class SGLangEngine(RayActor):
 
             if response is not None:
                 response.raise_for_status()
-        kill_process_tree(self.process.pid)
+        if self.process is not None:
+            kill_process_tree(self.process.pid)
+        else:
+            # RDT mode: kill scheduler actors
+            import ray
+
+            for actor in self._scheduler_actors:
+                try:
+                    ray.kill(actor)
+                except Exception:
+                    pass
 
     def get_weight_version(self):
         if self.node_rank != 0:
@@ -369,6 +407,31 @@ class SGLangEngine(RayActor):
             "unload_lora_adapter",
             {"lora_name": lora_name},
         )
+
+    def get_scheduler_actors(self) -> list:
+        """Return SchedulerActor handles when launched with use_ray=True (RDT mode).
+
+        Discovers scheduler actors by looking up named actors created by RayEngine.
+        """
+        if self._scheduler_actors:
+            return self._scheduler_actors
+
+        import ray
+
+        # RayEngine names actors as: sglang_scheduler_rank0node={ip}:{port}_pp{pp}_tp{tp}
+        # (port included via monkey-patch in _init_normal to avoid name collisions)
+        actors = []
+        server_args_tp = getattr(self.args, "rollout_num_gpus_per_engine", 1)
+        for tp_rank in range(server_args_tp):
+            try:
+                name = f"sglang_scheduler_rank0node={self.server_host.strip('[]')}:{self.server_port}_pp0_tp{tp_rank}"
+                actor = ray.get_actor(name)
+                actors.append(actor)
+            except ValueError:
+                logger.warning(f"Could not find SchedulerActor: {name}")
+
+        self._scheduler_actors = actors
+        return actors
 
     def release_memory_occupation(self, tags: list[str] = None):
         """Release memory occupation. Available tags: weights, kv_cache."""

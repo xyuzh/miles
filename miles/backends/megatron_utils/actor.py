@@ -38,6 +38,7 @@ from .parallel import create_megatron_parallel_state
 from .replay_utils import get_register_replay_list_func
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
+from .update_weight.update_weight_from_rdt import UpdateWeightFromRDT
 from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 
 logging.getLogger("megatron").setLevel(logging.WARNING)
@@ -134,7 +135,12 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.args.vocab_size is None:
             self.args.vocab_size = self.tokenizer.vocab_size
 
-        update_weight_cls = UpdateWeightFromTensor if self.args.colocate else UpdateWeightFromDistributed
+        if getattr(self.args, "use_rdt_weight_sync", False):
+            update_weight_cls = UpdateWeightFromRDT
+        elif self.args.colocate:
+            update_weight_cls = UpdateWeightFromTensor
+        else:
+            update_weight_cls = UpdateWeightFromDistributed
         self.weight_updater = update_weight_cls(
             self.args,
             self.model,
@@ -151,8 +157,6 @@ class MegatronTrainRayActor(TrainRayActor):
             # recover to actor in the end.
             self._switch_model("actor")
             self.sleep()
-
-        self.rollout_engines = None
 
         self.rollout_data_postprocess = None
         if self.args.rollout_data_postprocess_path is not None:
@@ -496,7 +500,8 @@ class MegatronTrainRayActor(TrainRayActor):
             torch_memory_saver.resume()
         with torch_memory_saver.disable() if self.args.offload_train else nullcontext():
             print_memory("before update_weights")
-            self.weight_updater.update_weights()
+            with timer("update_weights_transfer"):
+                self.weight_updater.update_weights()
             print_memory("after update_weights")
 
             if self.args.ci_test and len(rollout_engines) > 0 and not is_lora_enabled(self.args):

@@ -4,7 +4,6 @@ import ray
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from miles.ray.utils import NOSET_VISIBLE_DEVICES_ENV_VARS_LIST
 
 
 class RayTrainGroup:
@@ -55,7 +54,10 @@ class RayTrainGroup:
             # we need also set it to 0 to prevent nccl error.
             "NCCL_CUMEM_ENABLE": os.environ.get("NCCL_CUMEM_ENABLE", "0"),
             "NVTE_FP8_BLOCK_SCALING_FP32_SCALES": "1",
-            **{name: "1" for name in NOSET_VISIBLE_DEVICES_ENV_VARS_LIST},
+            # Override the job-level NOSET setting so Ray sets CUDA_VISIBLE_DEVICES
+            # for training actors. This ensures each NCCL rank sees only its assigned GPU.
+            # NIXL/RDT still works because it uses CUDA driver APIs for physical GPU IDs.
+            "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "0",
             **self.args.train_env_vars,
         }
 
@@ -83,7 +85,8 @@ class RayTrainGroup:
 
             actor_impl = FSDPTrainRayActor
 
-        TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
+        remote_kwargs = {"num_gpus": 1, "runtime_env": {"env_vars": env_vars}}
+        TrainRayActor = ray.remote(**remote_kwargs)(actor_impl)
 
         # Create worker actors
         self._actor_handlers = []
