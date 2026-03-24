@@ -198,6 +198,7 @@ class SGLangEngine(RayActor):
 
             server_args = ServerArgs(**server_args_dict)
             self.process = None
+
             self._server_thread = threading.Thread(
                 target=launch_server_ray, args=(server_args,), daemon=True
             )
@@ -417,13 +418,13 @@ class SGLangEngine(RayActor):
 
         import ray
 
-        # RayEngine names actors as: sglang_scheduler_rank0node={ip}_pp{pp}_tp{tp}
-        # Discover them by listing named actors
+        # RayEngine names actors as: sglang_scheduler_rank0node={ip}:{port}_pp{pp}_tp{tp}
+        # (port included via monkey-patch in _init_normal to avoid name collisions)
         actors = []
         server_args_tp = getattr(self.args, "rollout_num_gpus_per_engine", 1)
         for tp_rank in range(server_args_tp):
             try:
-                name = f"sglang_scheduler_rank0node={self.server_host.strip('[]')}_pp0_tp{tp_rank}"
+                name = f"sglang_scheduler_rank0node={self.server_host.strip('[]')}:{self.server_port}_pp0_tp{tp_rank}"
                 actor = ray.get_actor(name)
                 actors.append(actor)
             except ValueError:

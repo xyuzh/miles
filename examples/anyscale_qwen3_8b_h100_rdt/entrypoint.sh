@@ -6,7 +6,7 @@
 # Layout (GPU worker):
 #   Worker 0 (8x H100):
 #     GPU 0-3: Training (TP=2, DP=2)
-#     GPU 4-7: Rollout (2 SGLang engines, 2 GPUs each)
+#     GPU 4-6: Rollout (3 SGLang engines, 1 GPU each)
 
 set -ex
 
@@ -37,12 +37,10 @@ MODEL_ARGS=(
 )
 
 # ======================== Step 0: Sync local code to shared storage ========================
-# The working_dir is only available on the head node. Copy local sglang/miles/ray
-# source to shared storage so GPU workers can overlay them at runtime.
-echo "=== Syncing local sglang/miles/ray to shared storage ==="
+# The working_dir is only available on the head node. Copy local miles
+# source to shared storage so GPU workers can overlay it at runtime.
+echo "=== Syncing local miles to shared storage ==="
 mkdir -p ${CODE_DIR}
-rsync -a --delete _bundled/sglang_python/ ${CODE_DIR}/sglang_python/
-rsync -a --delete _bundled/ray_python/ ${CODE_DIR}/ray_python/
 rsync -a --delete miles/ ${CODE_DIR}/miles/
 cp train_async.py ${CODE_DIR}/train_async.py
 
@@ -52,32 +50,23 @@ cat > ${CODE_DIR}/run_training_rdt.sh << 'WRAPPER'
 set -ex
 CODE_DIR=/mnt/cluster_storage/local_code
 
-# Skip Ray overlay — Docker's Ray 2.54.0 already has RDT/NIXL support.
-# Overlaying local Ray 3.0.0.dev0 Python code onto 2.54.0 compiled extensions
-# causes ABI mismatches (rdt_manager, temp_dir, env_bool, etc.).
-echo "=== Skipping Ray overlay (using Docker Ray 2.54.0) ==="
-
-# Overlay local sglang onto Docker-installed version
-SGLANG_PATH=$(python3 -c "import sglang, os; print(os.path.dirname(sglang.__file__))")
-rm -rf "$SGLANG_PATH/srt" && cp -r ${CODE_DIR}/sglang_python/sglang/srt "$SGLANG_PATH/srt"
-if [ -d "${CODE_DIR}/sglang_python/sglang/jit_kernel" ]; then
-    rm -rf "$SGLANG_PATH/jit_kernel" && cp -r ${CODE_DIR}/sglang_python/sglang/jit_kernel "$SGLANG_PATH/jit_kernel"
-fi
-# Also overlay top-level .py files (launch_server.py for use_ray, utils.py, etc.)
-cp -f ${CODE_DIR}/sglang_python/sglang/launch_server.py "$SGLANG_PATH/launch_server.py"
-cp -f ${CODE_DIR}/sglang_python/sglang/utils.py "$SGLANG_PATH/utils.py"
-
-# Upgrade flashinfer to match local sglang's requirements
-pip install --no-cache-dir -q flashinfer_python==0.6.3 flashinfer_cubin==0.6.3
+# Raise locked memory limit for raylet so new worker processes inherit it
+# (required by NIXL/UCX for GPU memory registration)
+ulimit -l unlimited || true
+for pid in $(pgrep -f 'raylet'); do
+    sudo prlimit --pid $pid --memlock=unlimited:unlimited 2>/dev/null || true
+done
+# Load nvidia-peermem if available (needed for GPUDirect RDMA)
+sudo modprobe nvidia_peermem 2>/dev/null || true
 
 # Install NIXL for Ray RDT tensor transport
-pip install --no-cache-dir -q nixl
+pip install --no-cache-dir -q nixl==1.0.0
 
 # Overlay local miles onto Docker-installed version
 MILES_PATH=$(python3 -c "import miles, os; print(os.path.dirname(miles.__file__))")
 rm -rf "$MILES_PATH" && cp -r ${CODE_DIR}/miles/ "$MILES_PATH/"
 
-echo "=== Local ray/sglang/miles overlaid ==="
+echo "=== Local miles overlaid ==="
 exec python3 ${CODE_DIR}/train_async.py "$@"
 WRAPPER
 chmod +x ${CODE_DIR}/run_training_rdt.sh
@@ -201,7 +190,10 @@ RUNTIME_ENV_JSON='{
     "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
     "SGLANG_SKIP_SGL_KERNEL_VERSION_CHECK": "1",
     "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
-    "NCCL_IGNORE_DISABLED_P2P": "1"
+    "NCCL_IGNORE_DISABLED_P2P": "1",
+    "UCX_TLS": "tcp,shm,cuda_copy,cuda_ipc,cma",
+    "UCX_NET_DEVICES": "all",
+    "RAY_DISABLE_VERSION_CHECK": "1"
   }
 }'
 

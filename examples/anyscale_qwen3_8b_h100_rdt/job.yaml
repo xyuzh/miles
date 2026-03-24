@@ -1,11 +1,8 @@
 # Anyscale job config: Miles Qwen3-8B GRPO training on H100 with RDT weight sync
 # Single node x 8x H100-80GB
 #
-# Uses the existing Docker image (no rebuild). Local sglang/miles source is
+# SGLang and ray are baked into the Docker image. Local miles source is
 # overlaid at runtime via shared storage.
-#
-# Before submitting, bundle local sglang:
-#   bash examples/anyscale_qwen3_8b_h100_rdt/prepare.sh
 #
 # Submit with:
 #   anyscale job submit -f examples/anyscale_qwen3_8b_h100_rdt/job.yaml

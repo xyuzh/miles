@@ -9,7 +9,7 @@ Lifecycle & memory:
     1. Pause engines, flush cache
        No tensor work. Rank 0 sends Ray RPCs; all ranks barrier.
 
-    2. Iterate all params: all-gather → convert to HF → assemble via recipes
+    2. Iterate all params: all-gather → convert to HF → assemble → batch transfer
        Per param, on every TP rank:
          all_gather_param   – alloc tp_size buffers, NCCL fills them [copy]
                             – torch.cat partitions → full tensor   [copy]
@@ -19,14 +19,17 @@ Lifecycle & memory:
                             – quantize_params: new dtype tensor    [copy if enabled]
          assemble stacked   – accumulate refs per concat_group (no copy)
                             – torch.cat fuse when group complete   [copy]
-       Peak: one full-size gathered param + its HF conversion live at a time.
+         batch transfer     – when accumulated HF tensors >= _BATCH_BYTES,
+                              flush via RDT: .contiguous() [copy if needed],
+                              ray.put/NIXL, scheduler RDMA pull [network copy].
+                              Transfer is synchronous (blocks until all schedulers
+                              ack), so it does NOT overlap with the next all-gather.
+       After loop, transfer any remaining params.
+       Peak on tp_rank_zero: up to _BATCH_BYTES of accumulated HF tensors
+       + one full-size gathered param and its conversion intermediates.
+       Non-tp-rank-zero: one gathered param (immediately freed).
 
-    3. Transfer tensors to all scheduler actors via RDT
-       .contiguous() on each tensor          [copy if non-contiguous view]
-       ray.put via NIXL into shared memory  
-       scheduler RDMA pull into param buffers [copy over network]
-
-    4. Resume engines, post-process quantization
+    3. Resume engines, post-process quantization
        No tensor work. Rank 0 sends Ray RPCs; all ranks barrier.
 """
 
@@ -89,31 +92,47 @@ class RecipeShardedBucketBuilder:
             self._result.append((recipe.internal_name, tensor))
 
     def _accumulate_stacked(self, recipe: ParamShardingRecipe, sharded: torch.Tensor) -> None:
+        """Accumulate stacked param components and fuse when the group is complete.
+
+        Memory:
+            - Storing sharded ref per concat_order: no copy (keeps existing tensor alive).
+            - torch.cat when group complete: [copy] — allocates a new contiguous tensor.
+            - del accum entry: frees individual component refs (but tensors may
+              stay alive if referenced elsewhere until the fused tensor is consumed).
+        """
         group = recipe.concat_group
         if group not in self._stacked_accum:
             self._stacked_accum[group] = {}
 
-        self._stacked_accum[group][recipe.concat_order] = sharded
+        self._stacked_accum[group][recipe.concat_order] = sharded  # no copy
 
         expected_orders = self._concat_groups[group]
         if len(self._stacked_accum[group]) == len(expected_orders):
             ordered = [self._stacked_accum[group][o] for o in expected_orders]
-            fused = torch.cat(ordered, dim=0)
+            fused = torch.cat(ordered, dim=0)  # [copy]
             self._result.append((recipe.internal_name, fused))
             del self._stacked_accum[group]
 
-    def build(self) -> list[tuple[str, torch.Tensor]]:
-        assert not self._stacked_accum, f"Incomplete stacked params: {list(self._stacked_accum.keys())}"
+    def flush(self) -> list[tuple[str, torch.Tensor]]:
+        """Return and clear completed params (safe to call mid-iteration)."""
         result = self._result
         self._result = []
         return result
+
+    def accumulated_bytes(self) -> int:
+        """Total bytes of completed params waiting to be flushed."""
+        return sum(t.nelement() * t.element_size() for _, t in self._result)
+
+    def build(self) -> list[tuple[str, torch.Tensor]]:
+        assert not self._stacked_accum, f"Incomplete stacked params: {list(self._stacked_accum.keys())}"
+        return self.flush()
 
 
 class UpdateWeightFromRDT:
     """
     Update SchedulerActor engines via RDT/NIXL. No NCCL groups needed.
-    Iterates all params, all-gathers, converts to HF, shards per TP rank,
-    then transfers all sharded tensors to rollout engines in one shot.
+    Iterates all params, all-gathers, converts to HF, assembles via recipes,
+    then streams assembled tensors to rollout engines in batches.
     """
 
     def __init__(
@@ -167,6 +186,7 @@ class UpdateWeightFromRDT:
                     rollout_engines=self.rollout_engines,
                 )
             ray.get([e.continue_generation.remote() for e in self.rollout_engines])
+        # Barrier: all TP ranks wait until rank 0 finishes resuming engines.
         dist.barrier(group=get_gloo_group())
 
     # --- Called by the train actor for RDT ---
@@ -189,9 +209,31 @@ class UpdateWeightFromRDT:
                     post_process_quantization=False,
                     rollout_engines=self.rollout_engines,
                 )
+        # Barrier: all TP ranks wait until rank 0 finishes pausing engines.
         dist.barrier(group=get_gloo_group())
 
-    def _gather_and_shard_all_params(self) -> RecipeShardedBucketBuilder | None:
+    # 4 GiB batch threshold — keeps peak GPU memory bounded
+    _BATCH_BYTES = 4 * 1024**3
+
+    def _transfer_batch(self, batch: list[tuple[str, torch.Tensor]]) -> None:
+        """Transfer one batch of (name, tensor) pairs to all scheduler actors."""
+        if not batch:
+            return
+        param_names = [name for name, _ in batch]
+        tensor_views = [t.contiguous() for _, t in batch]
+
+        weights_ref = ray.put(tensor_views, _tensor_transport="nixl")
+        all_refs = []
+        for actor in self._scheduler_actors:
+            all_refs.append(actor.pull_weights.remote([weights_ref], param_names))
+        ray.get(all_refs)
+
+    @torch.no_grad()
+    def update_weights(self) -> None:
+        """Weight sync: pause, gather+shard params, stream via RDT in batches, resume."""
+        self.weight_version += 1
+        self._pause_engines()
+
         builder = None
         if self._is_tp_rank_zero:
             builder = RecipeShardedBucketBuilder(self._layout)
@@ -202,43 +244,26 @@ class UpdateWeightFromRDT:
             gathered = all_gather_param(self.args, name, param)
 
             if builder is not None:
-                self._feed_hf_tensors_to_builder(
-                    builder,
-                    convert_to_hf(self.args, self.model_name, name, gathered, self.quantization_config),
-                )
+                hf_tensors = convert_to_hf(self.args, self.model_name, name, gathered, self.quantization_config)
+                del gathered  # free all-gather temp memory before accumulating
+                self._feed_hf_tensors_to_builder(builder, hf_tensors)
+                del hf_tensors
+                # Flush when accumulated batch is large enough to bound GPU memory
+                if builder.accumulated_bytes() >= self._BATCH_BYTES:
+                    self._transfer_batch(builder.flush())
+            else:
+                del gathered
             if pbar is not None:
                 pbar.update(1)
 
+        # Transfer remaining params
+        if builder is not None:
+            self._transfer_batch(builder.build())
+
+        # Barrier: non-tp-rank-zero ranks skip builder/transfer entirely,
+        # so they wait here until rank 0 finishes all RDT transfers.
         dist.barrier(group=get_gloo_group())
 
         if pbar is not None:
             pbar.close()
-        return builder
-
-    def _transfer_to_schedulers(self, builder: RecipeShardedBucketBuilder) -> None:
-        # TODO: optimize by transferring in buckets to overlap all-gather/convert
-        # with NIXL transfer. Currently we gather ALL params first, then transfer
-        # ALL at once. Bucketed approach: transfer bucket N while gathering N+1.
-        # Also: pre-allocate output buffers in the builder and register with
-        # ray.experimental.register_nixl_memory() to avoid per-update allocation
-        # and NIXL registration overhead.
-        presharded = builder.build()
-        param_names = [name for name, _ in presharded]
-        self._tensor_views = [t.contiguous() for _, t in presharded]
-
-        weights_ref = ray.put(self._tensor_views, _tensor_transport="nixl")
-        all_refs = []
-        for actor in self._scheduler_actors:
-            all_refs.append(actor.pull_weights.remote([weights_ref], param_names))
-        ray.get(all_refs)
-        self._tensor_views = []
-
-    @torch.no_grad()
-    def update_weights(self) -> None:
-        """Weight sync: pause, gather+shard all params, transfer via RDT, resume."""
-        self.weight_version += 1
-        self._pause_engines()
-        builder = self._gather_and_shard_all_params()
-        if builder is not None:
-            self._transfer_to_schedulers(builder)
         self.resume_engines()
