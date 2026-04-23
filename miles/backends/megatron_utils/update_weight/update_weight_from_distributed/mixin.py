@@ -156,15 +156,25 @@ class DistBucketedWeightUpdateMixin:
     def _finalize_and_resume_engines(self, post_load_weights: bool = False) -> None:
         """Run post-process if needed and resume rollout engines."""
         if dist.get_rank() == 0:
-            # post_process_quantization is related to the process_weights_after_loading
-            # in the sglang rollout side, which should always be invoked after weight
-            # updating.
-            post_process_weights(
-                rollout_engines=self.rollout_engines,
-                restore_weights_before_load=False,
-                post_process_quantization=True,
-                post_load_weights=post_load_weights,
+            # Only call post_process_weights when there's quantization to finalize
+            # or p2p signalled post_load_weights. Otherwise the sglang server doesn't
+            # need the call and may not expose the endpoint (e.g. the RDT PR branch
+            # returns 404 for /post_process_weights). Mirrors the gating in RDT's
+            # resume_engines.
+            needs_post_process = (
+                post_load_weights
+                or (
+                    self.quantization_config is not None
+                    and self.quantization_config.get("quant_method") in ("compressed-tensors", "mxfp8")
+                )
             )
+            if needs_post_process:
+                post_process_weights(
+                    rollout_engines=self.rollout_engines,
+                    restore_weights_before_load=False,
+                    post_process_quantization=True,
+                    post_load_weights=post_load_weights,
+                )
             ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
 
     @torch.no_grad()

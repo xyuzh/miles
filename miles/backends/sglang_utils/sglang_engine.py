@@ -124,6 +124,7 @@ class SGLangEngine(RayActor):
         self.base_gpu_id = base_gpu_id
         self.sglang_overrides = sglang_overrides or {}
         self.num_gpus_per_engine = num_gpus_per_engine
+        self._scheduler_actors = []
 
     def init(
         self,
@@ -211,7 +212,13 @@ class SGLangEngine(RayActor):
         _sanity_check_server_args(actual_server_args, expect_server_args)
 
     def _init_normal(self, server_args_dict):
-        logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
+        use_rdt = getattr(self.args, "use_rdt_weight_sync", False)
+        if use_rdt:
+            server_args_dict["use_ray"] = True
+        logger.info(
+            f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}"
+            f"{' (use_ray=True for RDT)' if use_rdt else ''}"
+        )
         self.process = launch_server_process(ServerArgs(**server_args_dict))
 
         if self.node_rank == 0 and self.router_ip and self.router_port:
@@ -427,6 +434,58 @@ class SGLangEngine(RayActor):
             "unload_lora_adapter",
             {"lora_name": lora_name},
         )
+
+    def get_scheduler_actors(self) -> list:
+        """Return this engine's SchedulerActor handles (RDT mode, use_ray=True).
+
+        sglang's RayEngine registers one named actor per (pp, tp) rank with a name
+        like ``sglang_scheduler_node{rank0_ip}[_dp{dp}]_pp{pp}_tp{tp}_pg{hex}_bundle{idx}``.
+        The ``pg``/``bundle`` suffix is generated at launch and unknown to us, and
+        the actors may live in a different Ray namespace than this engine, so we
+        list named actors across namespaces and match by the stable node/pp/tp
+        prefix rather than reconstructing the full name.
+
+        Raises if any tp_rank does not match exactly one actor -- a silent
+        empty/partial list would otherwise turn the weight sync into a no-op or
+        index the wrong actor.
+
+        NOTE: name-based discovery cannot disambiguate multiple engines co-located
+        on the same node (same rank0 IP, distinct ``pg`` hex we don't know). That
+        topology needs the sglang server to report its own scheduler actor names.
+        """
+        if self._scheduler_actors:
+            return self._scheduler_actors
+
+        import ray
+
+        tp_size = getattr(self.args, "rollout_num_gpus_per_engine", 1)
+        host = self.server_host.strip("[]")
+        name_prefix = f"sglang_scheduler_node{host}"
+
+        try:
+            raw = ray.util.list_named_actors(all_namespaces=True)
+        except TypeError:
+            # Older Ray without the all_namespaces kwarg.
+            raw = ray.util.list_named_actors()
+        entries = [(e["name"], e.get("namespace")) if isinstance(e, dict) else (e, None) for e in raw]
+
+        actors = []
+        for tp_rank in range(tp_size):
+            tp_token = f"_pp0_tp{tp_rank}_"
+            matches = [(n, ns) for (n, ns) in entries if n.startswith(name_prefix) and tp_token in n]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"SchedulerActor discovery for engine {host} tp_rank={tp_rank} matched "
+                    f"{len(matches)} actors (expected 1): {[n for n, _ in matches]}. "
+                    f"prefix='{name_prefix}', token='{tp_token}'. If multiple engines share "
+                    "this node, name-based discovery is ambiguous and the sglang server must "
+                    "report its own scheduler actor names."
+                )
+            name, namespace = matches[0]
+            actors.append(ray.get_actor(name, namespace=namespace) if namespace else ray.get_actor(name))
+
+        self._scheduler_actors = actors
+        return actors
 
     def release_memory_occupation(self, tags: list[str] = None):
         """Release memory occupation. Available tags: weights, kv_cache."""
