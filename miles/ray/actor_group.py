@@ -85,7 +85,19 @@ class RayTrainGroup:
 
             actor_impl = FSDPTrainRayActor
 
-        TrainRayActor = ray.remote(num_gpus=1, runtime_env={"env_vars": env_vars})(actor_impl)
+        runtime_env = {"env_vars": env_vars}
+        remote_kwargs = {"num_gpus": 1, "runtime_env": runtime_env}
+        if getattr(self.args, "use_rdt_weight_sync", False):
+            # RDT/NIXL: update_weights() blocks this actor in ray.get() while it
+            # awaits each engine rank's pull_weights, and Ray's tensor-transport
+            # threads concurrently serve the NIXL reads of the
+            # ray.put(_tensor_transport="nixl") objects owned by this same actor.
+            # Raise the actor's concurrency above 1 so the blocking update_weights
+            # call does not starve those concurrent serve operations (one per
+            # engine rank this source feeds).
+            rdt_tp_size = getattr(self.args, "rollout_num_gpus_per_engine", 1)
+            remote_kwargs["max_concurrency"] = 1 + rdt_tp_size
+        TrainRayActor = ray.remote(**remote_kwargs)(actor_impl)
 
         # Create worker actors
         actor_handles = []

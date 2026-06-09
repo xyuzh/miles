@@ -1,0 +1,40 @@
+# Anyscale job config: same as job.yaml but with NCCL broadcast weight sync
+# instead of RDT/NIXL. For weight-sync calibration runs.
+#
+# Submit with:
+#   ANYSCALE_HOST=https://console.anyscale-staging.com \
+#     anyscale job submit -f examples/anyscale_qwen3_8b_h100_rdt/job_broadcast.yaml
+cloud: rkn-gpu-cloud
+
+name: miles-qwen3-8b-grpo-h100-broadcast
+
+containerfile: examples/anyscale_qwen3_8b_h100/Dockerfile.anyscale
+
+compute_config:
+  # Advanced instance config applies to all node groups.
+  advanced_instance_config:
+    metadata:
+      labels:
+        # For the llm team, change the queue name to llm-team-queue.
+        kueue.x-k8s.io/queue-name: llm-team-queue
+  head_node:
+    required_resources:
+      CPU: 4
+      memory: 16Gi
+  worker_nodes:
+    # 6 GPUs: 4 actor (TP=2 DP=2) + 1 rollout + 1 driver (--entrypoint-num-gpus 1).
+    # All on the same pod so /tmp is shared between driver and actors.
+    - required_resources:
+        CPU: 138
+        memory: 1440Gi
+        GPU: 6
+      required_labels:
+        ray.io/accelerator-type: H100
+      min_nodes: 1
+      max_nodes: 1
+
+working_dir: .
+
+entrypoint: pip install -e . --no-deps --user && WEIGHT_SYNC=broadcast bash examples/anyscale_qwen3_8b_h100_rdt/entrypoint.sh
+
+max_retries: 0

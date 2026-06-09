@@ -1,0 +1,40 @@
+# Anyscale job config: RDT/NIXL weight-sync correctness matrix.
+#
+# Runs these six-GPU-compatible rollout topologies sequentially:
+#   single:       1 engine x TP1
+#   multi_engine: 3 engines x TP1
+#   tp2:          1 engine x TP2
+#
+# Submit with:
+#   ANYSCALE_HOST=https://console.anyscale-staging.com \
+#     anyscale job submit -f examples/anyscale_qwen3_8b_h100_rdt/job_validate.yaml
+cloud: rkn-gpu-cloud
+
+name: miles-qwen3-8b-rdt-validate
+
+containerfile: examples/anyscale_qwen3_8b_h100/Dockerfile.anyscale
+
+compute_config:
+  advanced_instance_config:
+    metadata:
+      labels:
+        kueue.x-k8s.io/queue-name: llm-team-queue
+  head_node:
+    required_resources:
+      CPU: 4
+      memory: 16Gi
+  worker_nodes:
+    - required_resources:
+        CPU: 138
+        memory: 1440Gi
+        GPU: 6
+      required_labels:
+        ray.io/accelerator-type: H100
+      min_nodes: 1
+      max_nodes: 1
+
+working_dir: .
+
+entrypoint: pip install -e . --no-deps --user && VALIDATE_WEIGHT_SYNC=1 RDT_ROLLOUT_CASES=single,multi_engine,tp2 bash examples/anyscale_qwen3_8b_h100_rdt/entrypoint.sh
+
+max_retries: 0

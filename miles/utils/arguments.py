@@ -85,6 +85,17 @@ def get_miles_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--use-rdt-weight-sync",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable RDT/NIXL weight sync. When set, weights are transferred from "
+                    "trainer to rollout engines via Ray Direct Transport (NIXL RDMA) instead "
+                    "of NCCL broadcast. Requires sglang use_ray=True. No NCCL groups or "
+                    "lock needed — NIXL is point-to-point."
+                ),
+            )
+            parser.add_argument(
                 "--offload",
                 action="store_true",
                 default=False,
